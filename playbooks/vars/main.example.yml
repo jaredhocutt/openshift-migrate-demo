@@ -1,0 +1,22 @@
+app_name: demo-app
+
+# NOTE: You must create the destination repository ahead of time
+# The format of the repo will be quay.io/{{ quay.organization }}/{{ app_name }}
+quay:
+  username: user+robotaccount
+  password: T0k3n
+  organization: user
+
+openshift_local:
+  apps_subdomain: apps.local.example.com
+  env:
+    K8S_AUTH_HOST: local.example.com
+    K8S_AUTH_USERNAME: admin
+    K8S_AUTH_PASSWORD: password
+
+openshift_cloud:
+  apps_subdomain: apps.cloud.example.com
+  env:
+    K8S_AUTH_HOST: cloud.example.com
+    K8S_AUTH_USERNAME: admin
+    K8S_AUTH_PASSWORD: password

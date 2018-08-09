@@ -1,0 +1,15 @@
+[[source]]
+url = "https://pypi.python.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[dev-packages]
+pylint = "<2.0.0"
+
+[packages]
+ansible = ">=2.6"
+openshift = ">=0.6"
+pyyaml = ">=3.11"
+
+[requires]
+python_version = "3.6"

@@ -1,0 +1,542 @@
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars:
+    dev_project_name: demo-app-dev
+    prod_project_name: demo-app-prod
+
+  vars_files:
+    - "{{ playbook_dir }}/vars/main.yml"
+
+  tasks:
+    - set_fact:
+        local_kubeconfig: "{{ playbook_dir }}/local.kubeconfig"
+        cloud_kubeconfig: "{{ playbook_dir }}/cloud.kubeconfig"
+
+    - name: Get auth tokens from local cluster
+      shell: >-
+        oc login {{ openshift_local.env.K8S_AUTH_HOST }}
+        --username {{ openshift_local.env.K8S_AUTH_USERNAME }}
+        --password {{ openshift_local.env.K8S_AUTH_PASSWORD }}
+        --config "{{ local_kubeconfig }}"
+        > /dev/null 2>&1
+        && oc whoami --config "{{ local_kubeconfig }}" --show-token
+      register: get_openshift_local_auth_token
+
+    - name: Get auth tokens from cloud cluster
+      shell: >-
+        oc login {{ openshift_cloud.env.K8S_AUTH_HOST }}
+        --username {{ openshift_cloud.env.K8S_AUTH_USERNAME }}
+        --password {{ openshift_cloud.env.K8S_AUTH_PASSWORD }}
+        --config {{ cloud_kubeconfig }}
+        > /dev/null 2>&1
+        && oc whoami --config "{{ cloud_kubeconfig }}" --show-token
+      register: get_openshift_cloud_auth_token
+
+    - set_fact:
+        openshift_local: "{{ openshift_local | combine({'env': {'K8S_AUTH_API_KEY': get_openshift_local_auth_token.stdout, 'K8S_AUTH_KUBECONFIG': local_kubeconfig}}, recursive=True) }}"
+        openshift_cloud: "{{ openshift_cloud | combine({'env': {'K8S_AUTH_API_KEY': get_openshift_cloud_auth_token.stdout, 'K8S_AUTH_KUBECONFIG': cloud_kubeconfig}}, recursive=True) }}"
+
+    - name: Create external route for the registry
+      k8s:
+        namespace: default
+        definition:
+          apiVersion: v1
+          kind: Route
+          metadata:
+            name: docker-registry-external
+          spec:
+            host: registry.{{ openshift_local.apps_subdomain }}
+            port:
+              targetPort: 5000-tcp
+            tls:
+              termination: reencrypt
+            to:
+              kind: Service
+              name: docker-registry
+              weight: 100
+        state: present
+      environment: "{{ openshift_local.env }}"
+
+    - name: Check if dev project exists
+      command: >-
+        oc get project
+        {{ dev_project_name }}
+        --output json
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_dev_project_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Create dev project
+      shell: >-
+        oc new-project
+        {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      when: check_dev_project_exists.rc != 0
+
+    - name: Give user1 access to dev project
+      command: >-
+        oc policy
+        add-role-to-user
+        edit
+        user1
+        --namespace {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+
+    - name: Pause for the dev project to finish creating
+      pause:
+        seconds: 5
+      when: check_dev_project_exists.rc != 0
+
+    - name: Check if demo app exists in dev project
+      command: >-
+        oc get service
+        {{ app_name }}
+        --output json
+        --namespace {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_dev_demo_app_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Deploy demo app to the dev project
+      shell: >-
+        oc process
+        --filename "{{ playbook_dir }}/files/demo_app_dev.yml"
+        --param NAME={{ app_name }}
+        --param SOURCE_REPOSITORY_URL=https://github.com/jaredhocutt/openshift-migrate-demo.git
+        --param CONTEXT_DIR=demo_app
+        --labels app={{ app_name }}
+        --local
+        | oc apply --config "{{ local_kubeconfig }}" -f - --namespace {{ dev_project_name }}
+      environment: "{{ openshift_local.env }}"
+      register: process_demo_app_template_dev
+      when: check_dev_demo_app_exists.rc != 0
+
+    - name: Wait until the demo app deployment is complete
+      command: >-
+        oc get deploymentconfig
+        {{ app_name }}
+        --output json
+        --namespace {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: wait_dev_demo_app_deployed
+      until: (wait_dev_demo_app_deployed.stdout | from_json)['status']['availableReplicas'] > 0
+      delay: 5
+      retries: 75
+      changed_when: no
+
+    - name: Pause for demo
+      pause:
+        minutes: 5
+
+    - name: Get the builder service account token
+      command: >-
+        oc sa get-token
+        builder
+        --namespace {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: get_dev_builder_token
+      changed_when: no
+
+    - set_fact:
+        local_dev_builder_token: "{{ get_dev_builder_token.stdout }}"
+
+    - name: Copy production-ready image to external registry
+      command: >-
+        skopeo copy
+        --src-creds "unused:{{ local_dev_builder_token }}"
+        --dest-creds "{{ quay.username }}:{{ quay.password }}"
+        docker://registry.{{ openshift_local.apps_subdomain }}/{{ dev_project_name }}/{{ app_name }}:latest
+        docker://quay.io/{{ quay.organization }}/{{ app_name }}:prod
+
+    - name: Check if local prod project exists
+      command: >-
+        oc get project
+        {{ prod_project_name }}
+        --output json
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_local_prod_project_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Create local prod project
+      shell: >-
+        oc new-project
+        {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      when: check_local_prod_project_exists.rc != 0
+
+    - name: Give user1 access to prod project
+      command: >-
+        oc policy
+        add-role-to-user
+        edit
+        user1
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+
+    - name: Check if demo app exists in local prod project
+      command: >-
+        oc get service
+        {{ app_name }}
+        --output json
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_local_prod_demo_app_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Deploy demo app to the local prod project
+      shell: >-
+        oc process
+        --filename "{{ playbook_dir }}/files/demo_app_prod.yml"
+        --param NAME={{ app_name }}
+        --param SOURCE_REPOSITORY_URL=https://github.com/jaredhocutt/openshift-migrate-demo.git
+        --param CONTEXT_DIR=demo_app
+        --labels app={{ app_name }}
+        --local
+        | oc apply --config "{{ local_kubeconfig }}" -f - --namespace {{ prod_project_name }}
+      environment: "{{ openshift_local.env }}"
+      when: check_local_prod_demo_app_exists.rc != 0
+
+    - name: Wait until the demo app deployment is complete
+      command: >-
+        oc get deploymentconfig
+        {{ app_name }}
+        --output json
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: wait_local_prod_demo_app_deployed
+      until: (wait_local_prod_demo_app_deployed.stdout | from_json)['status']['availableReplicas'] > 0
+      delay: 5
+      retries: 75
+      changed_when: no
+
+    - name: Pause for demo
+      pause:
+        minutes: 5
+
+    - name: Create backup directory
+      tempfile:
+        state: directory
+      register: backup_dir
+
+    - block:
+        - name: Export objects in local prod project
+          command: >-
+            oc export
+            {{ item }}
+            --selector app={{ app_name }}
+            --output json
+            --namespace {{ prod_project_name }}
+            --config "{{ local_kubeconfig }}"
+          environment: "{{ openshift_local.env }}"
+          register: export_local_prod_project_objects
+          loop:
+            - secrets
+            - services
+            - imagestreams
+            - deploymentconfigs
+            - routes
+
+        - name: Create directory to save objects
+          file:
+            path: "{{ backup_dir.path }}/objects"
+            state: directory
+
+        - name: Save objects from local prod project
+          copy:
+            dest: "{{ backup_dir.path }}/objects/{{ item.item }}.json"
+            content: "{{ item.stdout }}"
+          loop: "{{ export_local_prod_project_objects.results }}"
+
+        - name: Get deployment configs
+          command: >-
+            oc get deploymentconfig
+            --selector app={{ app_name }}
+            --output name
+            --config "{{ local_kubeconfig }}"
+          environment: "{{ openshift_local.env }}"
+          register: get_local_prod_deploymentconfigs
+          changed_when: no
+          failed_when: no
+
+        - name: Scale all deployment configs to 0
+          k8s_scale:
+            api_version: v1
+            kind: DeploymentConfig
+            name: "{{ item | replace('deploymentconfigs/', '') }}"
+            namespace: "{{ prod_project_name }}"
+            replicas: 0
+            wait: yes
+            wait_timeout: 60
+          environment: "{{ openshift_local.env }}"
+          loop: "{{ get_local_prod_deploymentconfigs.stdout_lines }}"
+
+        - name: Get persistent volume claims
+          command: >-
+            oc get persistentvolumeclaims
+            --selector app={{ app_name }}
+            --output name
+            --config "{{ local_kubeconfig }}"
+          environment: "{{ openshift_local.env }}"
+          register: get_local_prod_persistentvolumeclaims
+          changed_when: no
+          failed_when: no
+
+        - set_fact:
+            pvc_names: "{{ get_local_prod_persistentvolumeclaims.stdout_lines | map('replace', 'persistentvolumeclaims/', '') | list }}"
+
+        - name: Create directories to save volume data
+          file:
+            path: "{{ backup_dir.path }}/volumes/{{ item }}"
+            state: directory
+          loop: "{{ pvc_names }}"
+
+        - name: Create pods to use for backup
+          k8s:
+            namespace: "{{ prod_project_name }}"
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: backup-pvc-{{ item }}
+              spec:
+                containers:
+                - image: quay.io/jhocutt/rhel-sync:latest
+                  imagePullPolicy: IfNotPresent
+                  name: backup-pvc-{{ item }}
+                  command: ["tail", "-f", "/dev/null"]
+                  resources:
+                    limits:
+                      memory: 512Mi
+                    requests:
+                      memory: 512Mi
+                  volumeMounts:
+                  - mountPath: /pvc_data
+                    name: pvc-data
+                restartPolicy: Always
+                volumes:
+                - name: pvc-data
+                  persistentVolumeClaim:
+                    claimName: "{{ item }}"
+            state: present
+          environment: "{{ openshift_local.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Wait until backup pods are running
+          command: >-
+            oc get pod
+            backup-pvc-{{ item }}
+            --output json
+            --namespace {{ prod_project_name }}
+            --config "{{ local_kubeconfig }}"
+          environment: "{{ openshift_local.env }}"
+          register: wait_local_backup_pods_running
+          until: (wait_local_backup_pods_running.stdout | from_json)['status']['phase'] == "Running"
+          delay: 5
+          retries: 75
+          loop: "{{ pvc_names }}"
+
+        - name: Backup persistent volume data
+          command: >-
+            oc rsync
+            backup-pvc-{{ item }}:/pvc_data/
+            "{{ backup_dir.path }}/volumes/{{ item }}"
+            --namespace {{ prod_project_name }}
+            --config "{{ local_kubeconfig }}"
+          environment: "{{ openshift_local.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Remove backup pods
+          k8s:
+            api_version: v1
+            kind: Pod
+            name: backup-pvc-{{ item }}
+            namespace: "{{ prod_project_name }}"
+            state: absent
+          environment: "{{ openshift_local.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Export persistent volume claim definitions in local prod project
+          shell: >-
+            oc export
+            persistentvolumeclaims
+            {{ item }}
+            --output json
+            --namespace {{ prod_project_name }}
+            --config "{{ local_kubeconfig }}"
+            | jq 'del(.metadata.annotations, .metadata.creationTimestamp, .spec.volumeName, .status)'
+          environment: "{{ openshift_local.env }}"
+          register: export_local_prod_project_pvcs
+          loop: "{{ pvc_names }}"
+
+        - name: Save persistent volume claim definitions from local prod project
+          copy:
+            dest: "{{ backup_dir.path }}/objects/pvc-{{ item.item }}.json"
+            content: "{{ item.stdout }}"
+          loop: "{{ export_local_prod_project_pvcs.results }}"
+
+        - name: Pause for demo
+          pause:
+            minutes: 5
+
+        - name: Check if cloud prod project exists
+          command: >-
+            oc get project
+            {{ prod_project_name }}
+            --output json
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          register: check_cloud_prod_project_exists
+          changed_when: no
+          failed_when: no
+
+        - name: Create cloud prod project
+          shell: >-
+            oc new-project
+            {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          when: check_cloud_prod_project_exists.rc != 0
+
+        - name: Give user1 access to cloud prod project
+          command: >-
+            oc policy
+            add-role-to-user
+            edit
+            user1
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+
+        - name: Create persistent volume claims in cloud prod project
+          command: >-
+            oc apply
+            --filename "{{ backup_dir.path }}/objects/pvc-{{ item }}.json"
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Create pods to use for restore
+          k8s:
+            namespace: "{{ prod_project_name }}"
+            definition:
+              apiVersion: v1
+              kind: Pod
+              metadata:
+                name: restore-pvc-{{ item }}
+              spec:
+                containers:
+                - image: quay.io/jhocutt/rhel-sync:latest
+                  imagePullPolicy: IfNotPresent
+                  name: restore-pvc-{{ item }}
+                  command: ["tail", "-f", "/dev/null"]
+                  resources:
+                    limits:
+                      memory: 512Mi
+                    requests:
+                      memory: 512Mi
+                  volumeMounts:
+                  - mountPath: /pvc_data
+                    name: pvc-data
+                restartPolicy: Always
+                volumes:
+                - name: pvc-data
+                  persistentVolumeClaim:
+                    claimName: "{{ item }}"
+            state: present
+          environment: "{{ openshift_cloud.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Wait until restore pods are running
+          command: >-
+            oc get pod
+            restore-pvc-{{ item }}
+            --output json
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          register: wait_cloud_restore_pods_running
+          until: (wait_cloud_restore_pods_running.stdout | from_json)['status']['phase'] == "Running"
+          delay: 5
+          retries: 75
+          loop: "{{ pvc_names }}"
+
+        - name: Restore persistent volume data
+          command: >-
+            oc rsync
+            "{{ backup_dir.path }}/volumes/{{ item }}/"
+            restore-pvc-{{ item }}:/pvc_data/
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Remove restore pods
+          k8s:
+            api_version: v1
+            kind: Pod
+            name: restore-pvc-{{ item }}
+            namespace: "{{ prod_project_name }}"
+            state: absent
+          environment: "{{ openshift_cloud.env }}"
+          loop: "{{ pvc_names }}"
+
+        - name: Wait until restore pods have stopped
+          command: >-
+            oc get pod
+            restore-pvc-{{ item }}
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          register: wait_cloud_restore_pods_stopped
+          until: wait_cloud_restore_pods_stopped.rc != 0
+          delay: 5
+          retries: 75
+          failed_when: no
+          loop: "{{ pvc_names }}"
+
+        - name: Update exported data
+          command: >-
+            {{ playbook_dir }}/files/fix_exports.py
+            "{{ backup_dir.path }}/objects"
+
+        - name: Restore objects in cloud prod project
+          command: >-
+            oc apply
+            --filename "{{ backup_dir.path }}/objects/{{ item }}.json"
+            --namespace {{ prod_project_name }}
+            --config "{{ cloud_kubeconfig }}"
+          environment: "{{ openshift_cloud.env }}"
+          loop:
+            - secrets
+            - services
+            - imagestreams
+            - deploymentconfigs
+            - routes
+
+        # TODO: Fix deploymentconfig before restoring
+        # TODO: Capture existing routes and recreate
+      always:
+        - name: Delete backup directory
+          file:
+            path: "{{ backup_dir.path }}"
+            state: absent
