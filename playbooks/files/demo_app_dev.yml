@@ -1,7 +1,7 @@
 apiVersion: template.openshift.io/v1
 kind: Template
 labels:
-  template: django-psql-persistent
+  template: openshift-guestbook
 message: |-
   The following service(s) have been created in your project: ${NAME}, ${DATABASE_SERVICE_NAME}.
 
@@ -21,7 +21,7 @@ metadata:
     openshift.io/support-url: https://access.redhat.com
     tags: quickstart,python,django
     template.openshift.io/bindable: "false"
-  name: django-psql-persistent
+  name: openshift-guestbook
 objects:
 - apiVersion: v1
   kind: Secret
@@ -143,17 +143,15 @@ objects:
                 name: ${NAME}
           image: ' '
           livenessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 8080
             initialDelaySeconds: 30
             timeoutSeconds: 3
-          name: django-psql-persistent
+          name: openshift-guestbook
           ports:
           - containerPort: 8080
           readinessProbe:
-            httpGet:
-              path: /health
+            tcpSocket:
               port: 8080
             initialDelaySeconds: 3
             timeoutSeconds: 3
@@ -164,7 +162,7 @@ objects:
     - imageChangeParams:
         automatic: true
         containerNames:
-        - django-psql-persistent
+        - openshift-guestbook
         from:
           kind: ImageStreamTag
           name: ${NAME}:latest
@@ -271,7 +269,7 @@ parameters:
   displayName: Name
   name: NAME
   required: true
-  value: django-psql-persistent
+  value: openshift-guestbook
 - description: The OpenShift Namespace where the ImageStream resides.
   displayName: Namespace
   name: NAMESPACE
@@ -296,7 +294,7 @@ parameters:
   displayName: Git Repository URL
   name: SOURCE_REPOSITORY_URL
   required: true
-  value: https://github.com/openshift/django-ex.git
+  value: https://github.com/jaredhocutt/openshift-guestbook.git
 - description: Set this to a branch name, tag or other ref of your repository if you
     are not using the default branch.
   displayName: Git Reference

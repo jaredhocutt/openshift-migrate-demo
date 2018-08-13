@@ -11,33 +11,7 @@
     - "{{ playbook_dir }}/vars/main.yml"
 
   tasks:
-    - set_fact:
-        local_kubeconfig: "{{ playbook_dir }}/local.kubeconfig"
-        cloud_kubeconfig: "{{ playbook_dir }}/cloud.kubeconfig"
-
-    - name: Get auth tokens from local cluster
-      shell: >-
-        oc login {{ openshift_local.env.K8S_AUTH_HOST }}
-        --username {{ openshift_local.env.K8S_AUTH_USERNAME }}
-        --password {{ openshift_local.env.K8S_AUTH_PASSWORD }}
-        --config "{{ local_kubeconfig }}"
-        > /dev/null 2>&1
-        && oc whoami --config "{{ local_kubeconfig }}" --show-token
-      register: get_openshift_local_auth_token
-
-    - name: Get auth tokens from cloud cluster
-      shell: >-
-        oc login {{ openshift_cloud.env.K8S_AUTH_HOST }}
-        --username {{ openshift_cloud.env.K8S_AUTH_USERNAME }}
-        --password {{ openshift_cloud.env.K8S_AUTH_PASSWORD }}
-        --config {{ cloud_kubeconfig }}
-        > /dev/null 2>&1
-        && oc whoami --config "{{ cloud_kubeconfig }}" --show-token
-      register: get_openshift_cloud_auth_token
-
-    - set_fact:
-        openshift_local: "{{ openshift_local | combine({'env': {'K8S_AUTH_API_KEY': get_openshift_local_auth_token.stdout, 'K8S_AUTH_KUBECONFIG': local_kubeconfig}}, recursive=True) }}"
-        openshift_cloud: "{{ openshift_cloud | combine({'env': {'K8S_AUTH_API_KEY': get_openshift_cloud_auth_token.stdout, 'K8S_AUTH_KUBECONFIG': cloud_kubeconfig}}, recursive=True) }}"
+    - import_tasks: tasks/auth.yml
 
     - name: Delete local cluster projects
       k8s:
@@ -60,3 +34,11 @@
       loop:
         - "{{ dev_project_name }}"
         - "{{ prod_project_name }}"
+
+    - name: Delete kubeconfig files
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ local_kubeconfig }}"
+        - "{{ cloud_kubeconfig }}"

@@ -1,0 +1,100 @@
+---
+
+- hosts: localhost
+  connection: local
+  gather_facts: no
+
+  vars_files:
+    - "{{ playbook_dir }}/vars/main.yml"
+
+  tasks:
+    - import_tasks: tasks/auth.yml
+
+    - name: Get the builder service account token
+      command: >-
+        oc sa get-token
+        builder
+        --namespace {{ dev_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: get_dev_builder_token
+      changed_when: no
+
+    - set_fact:
+        local_dev_builder_token: "{{ get_dev_builder_token.stdout }}"
+
+    - name: Copy production-ready image to external registry
+      command: >-
+        skopeo copy
+        --src-creds "unused:{{ local_dev_builder_token }}"
+        --dest-creds "{{ quay.username }}:{{ quay.password }}"
+        docker://registry.{{ openshift_local.apps_subdomain }}/{{ dev_project_name }}/{{ app_name }}:latest
+        docker://quay.io/{{ quay.organization }}/{{ app_name }}:prod
+
+    - name: Check if local prod project exists
+      command: >-
+        oc get project
+        {{ prod_project_name }}
+        --output json
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_local_prod_project_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Create local prod project
+      shell: >-
+        oc new-project
+        {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      when: check_local_prod_project_exists.rc != 0
+
+    - name: Give {{ demo_user }} access to prod project
+      command: >-
+        oc policy
+        add-role-to-user
+        edit
+        {{ demo_user }}
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+
+    - name: Check if demo app exists in local prod project
+      command: >-
+        oc get service
+        {{ app_name }}
+        --output json
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: check_local_prod_demo_app_exists
+      changed_when: no
+      failed_when: no
+
+    - name: Deploy demo app to the local prod project
+      shell: >-
+        oc process
+        --filename "{{ playbook_dir }}/files/demo_app_prod.yml"
+        --param NAME={{ app_name }}
+        --param SOURCE_REPOSITORY_URL=https://github.com/jaredhocutt/openshift-migrate-demo.git
+        --param CONTEXT_DIR=demo_app
+        --labels app={{ app_name }}
+        --local
+        | oc apply --config "{{ local_kubeconfig }}" -f - --namespace {{ prod_project_name }}
+      environment: "{{ openshift_local.env }}"
+      when: check_local_prod_demo_app_exists.rc != 0
+
+    - name: Wait until the demo app deployment is complete
+      command: >-
+        oc get deploymentconfig
+        {{ app_name }}
+        --output json
+        --namespace {{ prod_project_name }}
+        --config "{{ local_kubeconfig }}"
+      environment: "{{ openshift_local.env }}"
+      register: wait_local_prod_demo_app_deployed
+      until: (wait_local_prod_demo_app_deployed.stdout | from_json)['status']['availableReplicas'] > 0
+      delay: 5
+      retries: 75
+      changed_when: no

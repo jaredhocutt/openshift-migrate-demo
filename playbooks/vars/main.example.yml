@@ -1,5 +1,10 @@
 app_name: demo-app
 
+dev_project_name: "{{ app_name }}-dev"
+prod_project_name: "{{ app_name }}-prod"
+
+demo_user: user1
+
 # NOTE: You must create the destination repository ahead of time
 # The format of the repo will be quay.io/{{ quay.organization }}/{{ app_name }}
 quay:
